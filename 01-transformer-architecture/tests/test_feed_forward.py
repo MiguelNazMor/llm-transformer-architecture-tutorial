@@ -138,3 +138,115 @@ class TestSwiGLUFeedForward:
         ffn = SwiGLUFeedForward(d_model=128)
         r = repr(ffn)
         assert "SwiGLU" in r
+
+
+# ======================================================================
+# Text learning tests
+# ======================================================================
+
+
+class TestFeedForwardTextLearning:
+    """Tests that the feed-forward network can learn transformations.
+
+    The FFN is a position-wise MLP that transforms each token's
+    representation independently.  These tests verify that:
+        - The FFN can learn to map specific inputs to specific outputs
+        - The backward pass produces non-zero gradients for all weights
+        - The gradient check passes (analytical vs numerical gradients)
+    """
+
+    def test_ffn_learns_target_transformation(self) -> None:
+        """FFN should learn to approximate a target mapping via gradient descent.
+
+        We create a random input, a random target, and train the FFN to
+        minimize the MSE between its output and the target.  After 100
+        steps of gradient descent, the loss should be significantly lower
+        than the initial loss.
+        """
+        np.random.seed(42)
+        ffn = FeedForward(d_model=8, d_ff=32)
+
+        x = np.random.randn(1, 4, 8)
+        target = np.random.randn(1, 4, 8) * 0.5
+
+        # Compute initial loss
+        out = ffn.forward(x)
+        initial_loss = float(np.mean((out - target) ** 2))
+
+        # Train
+        lr = 0.01
+        for _ in range(100):
+            out = ffn.forward(x)
+            d_out = 2 * (out - target) / out.size
+            ffn.backward(d_out)
+            ffn.W_1 -= lr * ffn.grad_W_1
+            ffn.W_2 -= lr * ffn.grad_W_2
+            ffn.b_1 -= lr * ffn.grad_b_1
+            ffn.b_2 -= lr * ffn.grad_b_2
+            ffn.zero_grad()
+
+        final_loss = float(np.mean((ffn.forward(x) - target) ** 2))
+        assert final_loss < initial_loss * 0.5, (
+            f"FFN did not learn: loss {initial_loss:.4f} → {final_loss:.4f}"
+        )
+
+    def test_ffn_gradient_is_nonzero(self) -> None:
+        """After a backward pass, all weight gradients should be non-zero.
+
+        This ensures the gradient signal reaches all parameters, which
+        is necessary for the FFN to learn during training.
+        """
+        np.random.seed(42)
+        ffn = FeedForward(d_model=8, d_ff=16)
+        x = np.random.randn(1, 4, 8)
+        grad_out = np.random.randn(1, 4, 8)
+
+        ffn.forward(x)
+        ffn.backward(grad_out)
+
+        assert np.any(ffn.grad_W_1 != 0), "W_1 gradient is all zeros"
+        assert np.any(ffn.grad_W_2 != 0), "W_2 gradient is all zeros"
+        assert np.any(ffn.grad_b_1 != 0), "b_1 gradient is all zeros"
+        assert np.any(ffn.grad_b_2 != 0), "b_2 gradient is all zeros"
+
+    def test_ffn_gradient_check(self) -> None:
+        """Analytical FFN gradients should match numerical gradients.
+
+        This is a gradient check: we perturb each weight by a small amount
+        and compare the finite-difference gradient to the analytical one
+        computed by the backward pass.  They should match to within 1%.
+        """
+        np.random.seed(42)
+        ffn = FeedForward(d_model=4, d_ff=8)
+        x = np.random.randn(1, 2, 4)
+        grad_out = np.random.randn(1, 2, 4)
+
+        ffn.forward(x)
+        ffn.backward(grad_out)
+
+        eps = 1e-5
+        max_rel_error = 0.0
+
+        for param_name, param, grad in [
+            ("W_1", ffn.W_1, ffn.grad_W_1),
+            ("W_2", ffn.W_2, ffn.grad_W_2),
+        ]:
+            for _ in range(5):
+                i = np.random.randint(0, param.shape[0])
+                j = np.random.randint(0, param.shape[1])
+                orig = param[i, j]
+                param[i, j] = orig + eps
+                out_p = ffn.forward(x)
+                loss_p = float(np.sum(grad_out * out_p))
+                param[i, j] = orig - eps
+                out_m = ffn.forward(x)
+                loss_m = float(np.sum(grad_out * out_m))
+                param[i, j] = orig
+                num_grad = (loss_p - loss_m) / (2 * eps)
+                ana_grad = grad[i, j]
+                rel_error = abs(num_grad - ana_grad) / (abs(num_grad) + abs(ana_grad) + 1e-10)
+                max_rel_error = max(max_rel_error, rel_error)
+
+        assert max_rel_error < 0.01, (
+            f"FFN gradient check failed: max relative error = {max_rel_error:.6f}"
+        )

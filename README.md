@@ -60,9 +60,23 @@ cd 01-transformers-adapters-lora-qlora
 # uv will automatically install Python 3.14 and create a venv
 uv sync
 
-# Run code from any subfolder, e.g.:
-uv run python 01-transformer-architecture/src/main.py
+# Run chapter 1 training to generate base_model.npz / base_tokenizer.json
+# (or use the pre-trained artifacts already committed in the repo):
+PYTHONPATH=data:01-transformer-architecture/src uv run python 01-transformer-architecture/src/train.py
+
+# Run the PEFT comparison on the committed base model:
+PYTHONPATH=data:06-peft-ecosystem/src:05-qlora/src:04-lora/src:03-adapters/src:02-pretraining-finetuning/src:01-transformer-architecture/src \
+    uv run python 06-peft-ecosystem/src/compare.py
 ```
+
+## Pre-trained artifacts
+
+A pre-trained base model is committed in this repo so the PEFT comparisons in chapters 2-6 can be run without retraining:
+
+- `01-transformer-architecture/base_model.npz` (5.2M parameters)
+- `01-transformer-architecture/base_tokenizer.json`
+
+The model was trained on the public-domain text `data/general_corpus.txt` (Alice's Adventures in Wonderland) and the tokenizer was fit to the combined `data/general_corpus.txt` + `data/hp_corpus.txt`.  To regenerate the artifacts, run `01-transformer-architecture/src/train.py`.
 
 ## Key References
 

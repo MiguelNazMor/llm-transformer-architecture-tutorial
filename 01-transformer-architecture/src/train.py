@@ -1,72 +1,46 @@
-"""Walkthrough demo for the Transformer architecture.
+"""Training demo for the Transformer architecture.
 
-Demonstrates the full pipeline on a tiny corpus:
-    1. Train a BPE tokenizer
-    2. Create a small GPT model
-    3. Run a forward pass and compute loss
-    4. Show autoregressive text generation
+Demonstrates the full pipeline on a real corpus:
+    1. Train a BPE tokenizer on a combined corpus (general + domain)
+    2. Create a GPT model
+    3. Pre-train the model on a general corpus (Alice in Wonderland)
+    4. Show loss decreasing over training steps
+    5. Show autoregressive text generation before and after training
 
-Note: This demo does NOT run an actual training loop.  Training requires
-automatic differentiation (PyTorch/TensorFlow/JAX), which is outside the
-scope of this NumPy-from-scratch implementation.  The forward pass and
-generation showcase the complete architecture end-to-end.
+This demo runs an ACTUAL training loop using the manual backpropagation
+implementation.  The GPT model learns to predict the next token in the
+general corpus, and we can observe the loss decreasing and the generated
+text becoming more coherent.
+
+The tokenizer is trained on the combined general + HP corpus so that
+domain-specific vocabulary (Hogwarts, Gryffindor, Quidditch, etc.) gets
+proper subword merges.  Pre-training itself uses only the general corpus.
 """
 
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
-from model import GPT, cross_entropy_loss
+
+# Add the data/ directory to the path for corpus loading.
+_DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+sys.path.insert(0, str(_DATA_DIR))
+
+from loader import load_combined_corpus, load_general_corpus
+from model import GPT, cross_entropy_loss, save_model
 from tokenizer import BPETokenizer
+from trainer import Trainer
 
 # ---------------------------------------------------------------------------
-# Tiny training corpus
+# Corpora
 # ---------------------------------------------------------------------------
 
-CORPUS = [
-    "the cat sat on the mat",
-    "the dog sat on the log",
-    "the cat and the dog are friends",
-    "the mat is soft and warm",
-    "the log is hard and cold",
-    "the cat likes the warm mat",
-    "the dog likes the cold log",
-    "cats and dogs are animals",
-    "the sun is bright today",
-    "the sky is blue and clear",
-]
+# General pre-training corpus (Alice in Wonderland from Project Gutenberg).
+GENERAL_CORPUS = load_general_corpus()
 
-
-def prepare_batch(
-    texts: list[str], tokenizer: BPETokenizer, seq_len: int = 16
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Tokenizes texts and creates input/target pairs for next-token prediction.
-
-    Args:
-        texts: List of strings to encode.
-        tokenizer: Trained BPE tokenizer.
-        seq_len: Sequence length for the batch.
-
-    Returns:
-        Tuple of (input_ids, target_ids, mask) as numpy arrays.
-    """
-    all_ids: list[int] = []
-    for text in texts:
-        ids = tokenizer.encode(text)
-        all_ids.extend(ids)
-
-    # Take a single sequence of length seq_len + 1.
-    if len(all_ids) <= seq_len:
-        all_ids = (all_ids * ((seq_len + 2) // len(all_ids) + 1))[: seq_len + 1]
-
-    input_ids = all_ids[:seq_len]
-    target_ids = all_ids[1 : seq_len + 1]
-    mask = [1] * seq_len
-
-    return (
-        np.array([input_ids], dtype=np.int64),
-        np.array([target_ids], dtype=np.int64),
-        np.array([mask], dtype=np.float64),
-    )
+# Combined corpus for tokenizer training (general + HP so HP words get merges).
+COMBINED_CORPUS = load_combined_corpus()
 
 
 def count_parameters(model: GPT) -> int:
@@ -78,41 +52,31 @@ def count_parameters(model: GPT) -> int:
     Returns:
         Total parameter count.
     """
-    total = 0
-    total += model.token_embedding.weight.size
-    if hasattr(model.pos_embedding, "weight"):
-        total += model.pos_embedding.weight.size  # type: ignore[union-attr]
-    for block in model.blocks:
-        for attr_name in ("W_q", "W_k", "W_v", "W_o"):
-            total += getattr(block.self_attention, attr_name).size
-        for attr_name in ("W_1", "W_2", "W_gate", "W_up", "W_down"):
-            if hasattr(block.ffn, attr_name):
-                total += getattr(block.ffn, attr_name).size
-    return total
+    return sum(p.size for p in model.get_params().values())
 
 
 def main() -> None:
-    """Runs the walkthrough demo."""
-    print("=" * 60)
-    print("Transformer Architecture — Walkthrough Demo")
-    print("=" * 60)
+    """Runs the training demo."""
+    print("=" * 70)
+    print("Transformer Architecture — Pre-training Demo")
+    print("=" * 70)
 
     # ------------------------------------------------------------------
     # 1. Train the tokenizer
     # ------------------------------------------------------------------
-    print("\n[1/5] Training BPE tokenizer on a tiny corpus...")
+    print("\n[1/6] Training BPE tokenizer on combined corpus (general + HP)...")
     t0 = time.perf_counter()
-    tokenizer = BPETokenizer(vocab_size=300)
-    tokenizer.train(CORPUS)
+    tokenizer = BPETokenizer(vocab_size=2000)
+    tokenizer.train(COMBINED_CORPUS)
     t1 = time.perf_counter()
 
-    print(f"  Corpus:          {len(CORPUS)} sentences")
+    print(f"  Combined corpus: {len(COMBINED_CORPUS)} sentences")
     print(f"  Vocabulary size: {len(tokenizer)}")
     print(f"  Learned merges:  {len(tokenizer.merges)}")
     print(f"  Time:            {t1 - t0:.2f}s")
 
     # Show how a sentence gets tokenized.
-    sample = CORPUS[0]
+    sample = GENERAL_CORPUS[0]
     sample_ids = tokenizer.encode(sample)
     sample_tokens = [tokenizer.vocab.get(tid, "?") for tid in sample_ids]
     print(f'\n  Sample:   "{sample}"')
@@ -122,41 +86,73 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 2. Create the model
     # ------------------------------------------------------------------
-    print("\n[2/5] Creating a small GPT model...")
+    print("\n[2/6] Creating GPT model...")
     model = GPT(
         vocab_size=len(tokenizer),
-        d_model=64,
-        num_heads=4,
-        num_layers=2,
-        d_ff=256,
-        max_len=32,
-        dropout_rate=0.1,
+        d_model=256,
+        num_heads=8,
+        num_layers=6,
+        d_ff=1024,
+        max_len=64,
+        dropout_rate=0.0,  # no dropout for deterministic training
         use_learned_pos=True,
     )
     n_params = count_parameters(model)
-    print("  Architecture:  d_model=64, heads=4, layers=2, d_ff=256")
+    print("  Architecture:  d_model=256, heads=8, layers=6, d_ff=1024")
     print(f"  Parameters:    {n_params:,}")
 
     # ------------------------------------------------------------------
-    # 3. Prepare a batch and run a forward pass
+    # 3. Show generation BEFORE training
     # ------------------------------------------------------------------
-    print("\n[3/5] Running forward pass...")
-    input_ids, target_ids, mask = prepare_batch(CORPUS, tokenizer, seq_len=16)
+    print("\n[3/6] Text generation BEFORE training...")
+    np.random.seed(42)
+    prompts = ["the cat", "she said", "the queen", "Harry"]
+    for prompt in prompts:
+        prompt_ids = np.array([tokenizer.encode(prompt)], dtype=np.int64)
+        generated_ids = model.generate(prompt_ids, max_new_tokens=10, temperature=0.0)
+        generated_text = tokenizer.decode(generated_ids)
+        print(f'  "{prompt}" → "{generated_text}"')
+
+    # ------------------------------------------------------------------
+    # 4. Pre-train the model on the general corpus
+    # ------------------------------------------------------------------
+    print(f"\n[4/6] Pre-training on general corpus ({len(GENERAL_CORPUS)} sentences)...")
+    trainer = Trainer(model, tokenizer, lr=0.1, momentum=0.9)
+
+    # Compute initial loss
+    from trainer import prepare_text_batch
+
+    inp, tgt, msk = prepare_text_batch([GENERAL_CORPUS[0]], tokenizer, seq_len=32)
+    initial_logits = model.forward(inp, mask=msk, training=False)
+    initial_loss = cross_entropy_loss(initial_logits, tgt, msk)
+    print(f"  Initial loss: {initial_loss:.4f}")
 
     t0 = time.perf_counter()
-    logits = model.forward(input_ids, mask=mask, training=True)
+    trainer.train(GENERAL_CORPUS, epochs=5, seq_len=32, verbose=True)
     t1 = time.perf_counter()
 
-    loss = cross_entropy_loss(logits, target_ids, mask)
-    print(f"  Input shape:    {input_ids.shape}")
-    print(f"  Logits shape:   {logits.shape}  (batch, seq_len, vocab_size)")
-    print(f"  Cross-entropy loss: {loss:.4f}")
-    print(f"  Forward time:   {(t1 - t0) * 1000:.1f} ms")
+    final_loss = trainer.loss_history[-1]
+    print(f"\n  Final loss:   {final_loss:.4f}")
+    print(
+        f"  Loss reduction: {initial_loss:.4f} → {final_loss:.4f} "
+        f"({(1 - final_loss / initial_loss) * 100:.1f}% decrease)"
+    )
+    print(f"  Training time: {t1 - t0:.1f}s")
 
     # ------------------------------------------------------------------
-    # 4. Show attention shapes
+    # 5. Show generation AFTER training
     # ------------------------------------------------------------------
-    print("\n[4/5] Architecture details...")
+    print("\n[5/6] Text generation AFTER pre-training...")
+    for prompt in prompts:
+        prompt_ids = np.array([tokenizer.encode(prompt)], dtype=np.int64)
+        generated_ids = model.generate(prompt_ids, max_new_tokens=10, temperature=0.0)
+        generated_text = tokenizer.decode(generated_ids)
+        print(f'  "{prompt}" → "{generated_text}"')
+
+    # ------------------------------------------------------------------
+    # 6. Show architecture details
+    # ------------------------------------------------------------------
+    print("\n[6/6] Architecture details...")
     print(f"  Token embedding:   {model.token_embedding.weight.shape}")
     if hasattr(model.pos_embedding, "weight"):
         print(f"  Position embedding: {model.pos_embedding.weight.shape}")  # type: ignore[union-attr]
@@ -167,28 +163,26 @@ def main() -> None:
         ffn_type = type(ffn).__name__
         print(f"  Block {i}: attn heads={attn.num_heads}, d_k={attn.d_k}, FFN={ffn_type}")
 
-    # ------------------------------------------------------------------
-    # 5. Text generation
-    # ------------------------------------------------------------------
-    print("\n[5/5] Autoregressive text generation...")
-    prompts = ["the cat", "the dog", "the sun"]
-
-    for prompt in prompts:
-        prompt_ids = np.array([tokenizer.encode(prompt)], dtype=np.int64)
-        t0 = time.perf_counter()
-        generated_ids = model.generate(prompt_ids, max_new_tokens=8, temperature=0.8)
-        t1 = time.perf_counter()
-        generated_text = tokenizer.decode(generated_ids)
-        print(f'  "{prompt}" → "{generated_text}"  ({(t1 - t0) * 1000:.0f} ms)')
-
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("Demo complete!  All components verified:")
     print("  - BPE tokenizer (train, encode, decode)")
     print("  - Token + positional embeddings")
-    print("  - Multi-head self-attention")
-    print("  - SwiGLU feed-forward network")
+    print("  - Multi-head self-attention (with backward)")
+    print("  - Feed-forward network (with backward)")
     print("  - Causal masking for autoregressive generation")
-    print("=" * 60)
+    print("  - Manual backpropagation + SGD optimizer")
+    print("  - Real training loop with decreasing loss")
+    print("=" * 70)
+
+    # Save the trained model and tokenizer for use in other chapters.
+    _repo_root = Path(__file__).resolve().parents[2]
+    model_path = _repo_root / "01-transformer-architecture" / "base_model.npz"
+    tok_path = _repo_root / "01-transformer-architecture" / "base_tokenizer.json"
+    save_model(model, str(model_path))
+    tokenizer.save(str(tok_path))
+    print(f"\nModel saved to {model_path}")
+    print(f"Tokenizer saved to {tok_path}")
+    print("Chapters 2-6 can now load this shared base model.")
 
 
 if __name__ == "__main__":

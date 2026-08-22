@@ -218,3 +218,108 @@ class TestMultiHeadAttention:
         out1 = mha.forward(x, training=False)
         out2 = mha.forward(x, training=False)
         assert np.allclose(out1, out2)
+
+
+# ======================================================================
+# Text learning tests
+# ======================================================================
+
+
+class TestAttentionTextLearning:
+    """Tests that attention can learn patterns from text-like data.
+
+    These tests verify that the attention mechanism — when trained with
+    backpropagation — can learn to focus on specific positions, and that
+    the causal mask correctly prevents attending to future tokens during
+    text generation.
+    """
+
+    def test_attention_learns_to_focus(
+        self,
+    ) -> None:
+        """Attention weights should shift after training on a target pattern.
+
+        We create a simple setup where the attention output at position 1
+        should equal the input at position 0 (a "copy" pattern).  After
+        training with gradient descent, the attention weights at position 1
+        should shift toward position 0.
+        """
+        np.random.seed(42)
+        d_model = 8
+        mha = MultiHeadAttention(d_model=d_model, num_heads=2, dropout_rate=0.0)
+
+        # Create a simple input: 3 tokens
+        x = np.random.randn(1, 3, d_model)
+
+        # Target: output at position 1 should be the input at position 0
+        target = np.zeros_like(x)
+        target[0, 1, :] = x[0, 0, :]
+
+        # Train for several steps
+        lr = 0.1
+        initial_loss = None
+        for step in range(50):
+            out = mha.forward(x, training=True)
+            loss = float(np.mean((out - target) ** 2))
+            if initial_loss is None:
+                initial_loss = loss
+
+            # Backward: d_out = 2 * (out - target) / N
+            d_out = 2 * (out - target) / out.size
+            mha.backward(d_out)
+
+            # Update weights
+            mha.W_q -= lr * mha.grad_W_q
+            mha.W_k -= lr * mha.grad_W_k
+            mha.W_v -= lr * mha.grad_W_v
+            mha.W_o -= lr * mha.grad_W_o
+            mha.zero_grad()
+
+        final_loss = float(np.mean((mha.forward(x, training=False) - target) ** 2))
+        assert final_loss < initial_loss, (
+            f"Attention did not learn: loss {initial_loss:.4f} → {final_loss:.4f}"
+        )
+
+    def test_causal_mask_blocks_future_in_generation(self) -> None:
+        """Causal mask should prevent attending to future positions.
+
+        In autoregressive text generation, token i must not attend to
+        token j > i.  We verify this by checking that the attention output
+        at position 0 does not change when future positions are modified.
+        """
+        np.random.seed(42)
+        d_model = 8
+        mha = MultiHeadAttention(d_model=d_model, num_heads=1, dropout_rate=0.0)
+        causal_mask = create_causal_mask(4)
+
+        x = np.random.randn(1, 4, d_model)
+        out_original = mha.forward(x, mask=causal_mask, training=False)
+
+        # Modify future positions (1, 2, 3) — should NOT affect output at position 0
+        x_modified = x.copy()
+        x_modified[0, 1:, :] += 10.0  # large perturbation to future tokens
+        out_modified = mha.forward(x_modified, mask=causal_mask, training=False)
+
+        # Output at position 0 should be identical
+        assert np.allclose(out_original[0, 0, :], out_modified[0, 0, :], atol=1e-10), (
+            "Causal mask failed: output at position 0 changed when future positions were modified"
+        )
+
+    def test_attention_gradient_is_nonzero(self) -> None:
+        """After a backward pass, all attention weight gradients should be non-zero.
+
+        This ensures that the gradient signal flows through all parts of
+        the attention mechanism, which is necessary for learning.
+        """
+        np.random.seed(42)
+        mha = MultiHeadAttention(d_model=8, num_heads=2, dropout_rate=0.0)
+        x = np.random.randn(1, 4, 8)
+        grad_out = np.random.randn(1, 4, 8)
+
+        mha.forward(x, training=True)
+        mha.backward(grad_out)
+
+        assert np.any(mha.grad_W_q != 0), "W_q gradient is all zeros"
+        assert np.any(mha.grad_W_k != 0), "W_k gradient is all zeros"
+        assert np.any(mha.grad_W_v != 0), "W_v gradient is all zeros"
+        assert np.any(mha.grad_W_o != 0), "W_o gradient is all zeros"

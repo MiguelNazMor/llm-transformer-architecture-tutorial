@@ -97,6 +97,9 @@ Where:
 
 Modern models (GPT, Llama) typically use **learned positional embeddings** or **RoPE (Rotary Position Embeddings)** instead, which we'll cover later.
 
+> **Code:** [`src/embeddings.py`](src/embeddings.py) — `TokenEmbedding`, `sinusoidal_positional_encoding()`, `LearnedPositionalEmbedding`
+> **Tests:** [`tests/test_embeddings.py`](tests/test_embeddings.py) — shape checks, unique positions, even/odd pattern, gradient flow for seen vs unseen tokens
+
 ---
 
 ## 2. Self-Attention — The Core Mechanism
@@ -145,6 +148,9 @@ Let's break this down step by step:
 
 If token *i*'s query is similar to token *j*'s key, their dot product is large, and token *i* will incorporate a lot of token *j*'s value. The model learns to make queries and keys align when two tokens are semantically related.
 
+> **Code:** [`src/attention.py`](src/attention.py) — `scaled_dot_product_attention()`, `create_causal_mask()`
+> **Tests:** [`tests/test_attention.py`](tests/test_attention.py) — `TestScaledDotProductAttention` (output shape, sums to 1, causal mask, dropout)
+
 ---
 
 ## 3. Multi-Head Attention
@@ -167,6 +173,9 @@ The original paper uses `h = 8` heads with `d_k = d_v = d_model/h = 64`.
 
 **Computational complexity**: O(n² · d_model) where n is the sequence length. This quadratic cost is the main bottleneck for long sequences and the reason for FlashAttention and other optimizations.
 
+> **Code:** [`src/attention.py`](src/attention.py) — `MultiHeadAttention` (forward, backward, cross_attention_forward)
+> **Tests:** [`tests/test_attention.py`](tests/test_attention.py) — `TestMultiHeadAttention` (shape, divisibility, cross-attn, determinism) + `TestAttentionTextLearning` (learns to focus, causal mask blocks future, gradient non-zero)
+
 ---
 
 ## 4. Feed-Forward Network (FFN)
@@ -188,6 +197,9 @@ SwiGLU(x) = (x·W_1 ⊙ Swish(x·W_2))·W_3
 ```
 
 Where `Swish(x) = x · σ(x)` and `⊙` is element-wise multiplication. SwiGLU consistently outperforms ReLU in large models (used in Llama, PaLM).
+
+> **Code:** [`src/feed_forward.py`](src/feed_forward.py) — `FeedForward` (ReLU), `SwiGLUFeedForward` (SwiGLU), both with `forward()` and `backward()`
+> **Tests:** [`tests/test_feed_forward.py`](tests/test_feed_forward.py) — shape, non-linearity, default d_ff + `TestFeedForwardTextLearning` (learns target, gradient non-zero, gradient check)
 
 ---
 
@@ -213,6 +225,9 @@ x + Sublayer(LayerNorm(x))
 ```
 
 Pre-norm is more stable during training, especially for very deep models.
+
+> **Code:** [`src/transformer_block.py`](src/transformer_block.py) — `layer_norm()`, `backward_layer_norm()`, `RMSNorm`, `EncoderBlock`, `DecoderBlock` (all with `forward()` + `backward()`)
+> **Tests:** [`tests/test_model.py`](tests/test_model.py) — `TestTransformer` (encode/decode shapes) + block-level gradient tests in `TestGPTTextLearning`
 
 ---
 
@@ -241,6 +256,9 @@ Modern language models like GPT and Llama use only the decoder stack (no encoder
 - Scales better for generative tasks.
 - Can be trained on vast amounts of unlabeled text (next-token prediction is self-supervised).
 - The same model can be used for many tasks by reformulating them as text generation (in-context learning).
+
+> **Code:** [`src/model.py`](src/model.py) — `Transformer` (encoder-decoder), `GPT` (decoder-only with `forward()`, `backward()`, `generate()`)
+> **Tests:** [`tests/test_model.py`](tests/test_model.py) — `TestGPT` (forward shape, determinism, generation, sinusoidal pos) + `TestGPTTextLearning` (loss decreases, predicts next token, generation contains corpus words, backward produces gradients)
 
 ---
 
@@ -280,6 +298,9 @@ Used by T5 and some Llama variants. Starts with a large vocabulary and iterative
 - `[PAD]`: Padding token to make all sequences in a batch the same length.
 - `[MASK]` (BERT): Masked token for masked language modeling.
 
+> **Code:** [`src/tokenizer.py`](src/tokenizer.py) — `BPETokenizer` (train, encode, decode, encode_batch)
+> **Tests:** [`tests/test_tokenizer.py`](tests/test_tokenizer.py) — initialization, training, roundtrip, unknown words, batch encoding + `TestBPETokenizerTextLearning` (frequent word becomes single token, fewer tokens than rare, vocab entries, encoding consistency)
+
 ---
 
 ## 8. Training the Transformer
@@ -298,6 +319,11 @@ The original Transformer was trained on machine translation (WMT 2014 English-Ge
 ### Why This Training Recipe Matters
 
 Many of these design choices (warmup + decay schedule, Adam β₂ = 0.98 instead of 0.999, label smoothing) were carefully tuned for the Transformer. Modern LLMs inherit many of these choices but with important modifications (AdamW, cosine schedules, larger batches).
+
+> **Code:** [`src/trainer.py`](src/trainer.py) — `SGD` optimizer (with momentum + gradient clipping), `Trainer` (training loop), `prepare_text_batch()`
+> **Code:** [`src/train.py`](src/train.py) — End-to-end training demo (tokenizer → model → train → generate)
+> **Code:** [`src/model.py`](src/model.py) — `cross_entropy_loss()`, `softmax_cross_entropy_backward()`, `GPT.backward()`
+> **Tests:** [`tests/test_text_prediction.py`](tests/test_text_prediction.py) — loss decreases, overfitting, next-token prediction, generation quality, gradient correctness (analytical vs numerical)
 
 ---
 
@@ -331,6 +357,13 @@ Many of these design choices (warmup + decay schedule, Adam β₂ = 0.98 instead
 - **SwiGLU** activation in FFN: Better performance than ReLU/GELU.
 - **Pre-norm** architecture for training stability.
 
+> **Code (in this repo):**
+> - SwiGLU FFN: [`src/feed_forward.py`](src/feed_forward.py) — `SwiGLUFeedForward`
+> - RMSNorm: [`src/transformer_block.py`](src/transformer_block.py) — `RMSNorm`
+> - Learned positional embeddings: [`src/embeddings.py`](src/embeddings.py) — `LearnedPositionalEmbedding`
+> - GPT-style decoder-only model: [`src/model.py`](src/model.py) — `GPT`
+> **Tests:** [`tests/test_feed_forward.py`](tests/test_feed_forward.py) (SwiGLU), [`tests/test_model.py`](tests/test_model.py) (`test_sinusoidal_pos`)
+
 ---
 
 ## Code Guide
@@ -343,19 +376,21 @@ Every component is built from scratch — no deep learning framework required.
 ```
 src/
 ├── tokenizer.py         # BPE tokenizer (train, encode, decode)
-├── attention.py         # Scaled dot-product + multi-head attention
-├── embeddings.py        # Token embeddings + positional encodings
-├── feed_forward.py      # ReLU FFN + SwiGLU FFN
-├── transformer_block.py # Encoder & decoder blocks + RMSNorm
-├── model.py             # Full Transformer + GPT-style model
-└── train.py             # End-to-end walkthrough demo
+├── attention.py         # Scaled dot-product + multi-head attention (+ backward)
+├── embeddings.py        # Token embeddings + positional encodings (+ backward)
+├── feed_forward.py      # ReLU FFN + SwiGLU FFN (+ backward)
+├── transformer_block.py # Encoder & decoder blocks + RMSNorm (+ backward)
+├── model.py             # Full Transformer + GPT-style model (+ backward)
+├── trainer.py           # SGD optimizer + training loop
+└── train.py             # End-to-end training demo
 
 tests/
-├── test_tokenizer.py
-├── test_attention.py
-├── test_embeddings.py
-├── test_feed_forward.py
-└── test_model.py
+├── test_tokenizer.py          # Tokenizer + text learning tests
+├── test_attention.py          # Attention + text learning tests
+├── test_embeddings.py         # Embeddings + text learning tests
+├── test_feed_forward.py       # FFN + text learning tests
+├── test_model.py              # Model + text learning tests
+└── test_text_prediction.py    # End-to-end training & prediction tests
 ```
 
 ### Setup
@@ -370,10 +405,11 @@ uv sync
 export PYTHONPATH=01-transformer-architecture/src
 ```
 
-### Run the Walkthrough Demo
+### Run the Training Demo
 
 The demo ties everything together: trains a BPE tokenizer on a tiny corpus,
-creates a small GPT model, runs a forward pass, and generates text.
+creates a small GPT model, trains it with manual backpropagation, and shows
+text generation before and after training.
 
 ```bash
 PYTHONPATH=01-transformer-architecture/src uv run python 01-transformer-architecture/src/train.py
@@ -383,10 +419,10 @@ PYTHONPATH=01-transformer-architecture/src uv run python 01-transformer-architec
 
 ```
 ============================================================
-Transformer Architecture — Walkthrough Demo
+Transformer Architecture — Training Demo
 ============================================================
 
-[1/5] Training BPE tokenizer on a tiny corpus...
+[1/6] Training BPE tokenizer on a tiny corpus...
   Corpus:          10 sentences
   Vocabulary size: 300
   Learned merges:  40
@@ -396,42 +432,54 @@ Transformer Architecture — Walkthrough Demo
   Token IDs: [261, 267, 272, 273, 261, 270]
   Tokens:    ['the', 'cat', 'sat', 'on', 'the', 'mat']
 
-[2/5] Creating a small GPT model...
+[2/6] Creating a small GPT model...
   Architecture:  d_model=64, heads=4, layers=2, d_ff=256
-  Parameters:    119,552
+  Parameters:    120,704
 
-[3/5] Running forward pass...
-  Input shape:    (1, 16)
-  Logits shape:   (1, 16, 300)  (batch, seq_len, vocab_size)
-  Cross-entropy loss: 5.7576
-  Forward time:   3.3 ms
+[3/6] Text generation BEFORE training...
+  "the cat" → "the cat Û ö  ö ! , ,"       ← gibberish (random weights)
+  "the dog" → "the dog ö ì ö ¸ Ü  Ç"
+  "the sun" → "the s u n   ½ ö  ¸ ½"
 
-[4/5] Architecture details...
+[4/6] Training the model with backpropagation...
+  Initial loss: 5.7540
+  Step  100/1000 | Epoch 10/100 | Loss: 1.2157
+  Step  200/1000 | Epoch 20/100 | Loss: 0.3695
+  ...
+  Step 1000/1000 | Epoch 100/100 | Loss: 0.2084
+
+  Final loss:   0.2084
+  Loss reduction: 5.7540 → 0.2084 (96.4% decrease)
+  Training time: 4.65s
+
+[5/6] Text generation AFTER training...
+  "the cat" → "the cat likes the warm mat the cat likes the"   ← coherent!
+  "the dog" → "the dog likes the cold log the dog likes the"
+  "the sun" → "the s u n is b ri g h t t o"
+
+[6/6] Architecture details...
   Token embedding:   (300, 64)
   Position embedding: (32, 64)
   Block 0: attn heads=4, d_k=16, FFN=FeedForward
   Block 1: attn heads=4, d_k=16, FFN=FeedForward
 
-[5/5] Autoregressive text generation...
-  "the cat" → "the cat ..."  (16 ms)
-  "the dog" → "the dog ..."  (18 ms)
-  "the sun" → "the sun ..."  (18 ms)
-
 ============================================================
 Demo complete!  All components verified:
   - BPE tokenizer (train, encode, decode)
   - Token + positional embeddings
-  - Multi-head self-attention
-  - SwiGLU feed-forward network
+  - Multi-head self-attention (with backward)
+  - Feed-forward network (with backward)
   - Causal masking for autoregressive generation
+  - Manual backpropagation + SGD optimizer
+  - Real training loop with decreasing loss
 ============================================================
 ```
 
-> **Note:** Generated text will be gibberish because the model has random
-> weights (no training was performed).  Training requires automatic
-> differentiation (PyTorch/JAX), which is outside the scope of this
-> NumPy-from-scratch implementation.  The demo verifies that all components
-> connect correctly and produce valid tensor shapes.
+> **Note:** The model trains using **manual backpropagation** — analytical
+> gradients are implemented by hand for every layer (attention, FFN,
+> embeddings, layer norm).  No automatic differentiation framework is used.
+> The before/after generation comparison shows the model going from gibberish
+> to coherent corpus text as it learns.
 
 ### Run the Tests
 
@@ -439,7 +487,7 @@ Demo complete!  All components verified:
 PYTHONPATH=01-transformer-architecture/src uv run pytest 01-transformer-architecture/tests/ -v
 ```
 
-**Expected output:** 41 passed in ~1s.
+**Expected output:** 71 passed in ~12s.
 
 ### Using Individual Modules
 
@@ -636,6 +684,37 @@ print(logits.shape)  # (1, 3, 1000)
 # Encode only (get contextualized representations)
 enc_out = transformer.encode(src_ids, training=False)
 print(enc_out.shape)  # (1, 4, 512)
+```
+
+#### Training (`trainer.py`)
+
+SGD optimizer and training loop for the GPT model.
+
+```python
+import numpy as np
+from model import GPT
+from tokenizer import BPETokenizer
+from trainer import Trainer
+
+# Train tokenizer
+corpus = ["the cat sat on the mat", "the dog sat on the log"]
+tok = BPETokenizer(vocab_size=300)
+tok.train(corpus)
+
+# Create model
+model = GPT(vocab_size=len(tok), d_model=32, num_heads=4, num_layers=2, d_ff=64)
+
+# Train
+trainer = Trainer(model, tok, lr=0.1, momentum=0.9)
+losses = trainer.train(corpus, epochs=100, seq_len=8)
+
+print(f"Initial loss: {losses[0]:.4f}")
+print(f"Final loss:   {losses[-1]:.4f}")
+
+# Generate text after training
+prompt = np.array([tok.encode("the cat")], dtype=np.int64)
+generated = model.generate(prompt, max_new_tokens=5, temperature=0.0)
+print(tok.decode(generated))  # "the cat sat on the mat ..."
 ```
 
 ### Linting

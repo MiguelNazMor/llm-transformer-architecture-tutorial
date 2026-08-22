@@ -178,3 +178,103 @@ class TestLearnedPositionalEmbedding:
         pe = LearnedPositionalEmbedding(max_len=10, d_model=32)
         with pytest.raises(ValueError, match="exceeds"):
             pe.forward(seq_len=11)
+
+
+# ======================================================================
+# Text learning tests
+# ======================================================================
+
+
+class TestEmbeddingTextLearning:
+    """Tests that embeddings learn meaningful representations from text.
+
+    These tests verify that:
+        - Token embeddings produce consistent vectors for the same token
+        - The backward pass correctly accumulates gradients for seen tokens
+        - Gradients for unseen tokens remain zero
+        - Positional embeddings receive gradients during training
+    """
+
+    def test_same_token_same_vector(self) -> None:
+        """The same token ID should always map to the same embedding vector.
+
+        This is the fundamental property of an embedding lookup: it's a
+        deterministic function from token ID to vector.  If token 5 appears
+        at positions 0, 2, and 4, all three should produce the same vector.
+        """
+        np.random.seed(42)
+        emb = TokenEmbedding(vocab_size=100, d_model=32)
+        ids = np.array([[5, 10, 5, 20, 5]], dtype=np.int64)
+        out = emb.forward(ids)
+
+        # Token 5 appears at positions 0, 2, 4 — all should have the same vector
+        assert np.allclose(out[0, 0, :], out[0, 2, :])
+        assert np.allclose(out[0, 0, :], out[0, 4, :])
+        # Token 10 at position 1 should be different from token 5
+        assert not np.allclose(out[0, 0, :], out[0, 1, :])
+
+    def test_embedding_gradient_for_seen_tokens(self) -> None:
+        """Backward pass should produce non-zero gradients for tokens in the input.
+
+        When the embedding output is used and gradients flow back, only the
+        tokens that appeared in the input should receive gradient updates.
+        Tokens not in the input should have zero gradient.
+        """
+        np.random.seed(42)
+        emb = TokenEmbedding(vocab_size=100, d_model=16)
+        ids = np.array([[1, 2, 3]], dtype=np.int64)
+        emb.forward(ids)
+
+        grad = np.random.randn(1, 3, 16)
+        emb.backward(grad)
+
+        # Tokens 1, 2, 3 were in the input — should have non-zero gradient
+        assert np.any(emb.grad_weight[1, :] != 0), "Token 1 has zero gradient"
+        assert np.any(emb.grad_weight[2, :] != 0), "Token 2 has zero gradient"
+        assert np.any(emb.grad_weight[3, :] != 0), "Token 3 has zero gradient"
+
+    def test_embedding_gradient_for_unseen_tokens_is_zero(self) -> None:
+        """Backward pass should produce zero gradients for tokens NOT in the input.
+
+        Only tokens that appeared in the forward pass should receive gradient.
+        This ensures that the embedding for unseen tokens doesn't change
+        during training, which is important for stability.
+        """
+        np.random.seed(42)
+        emb = TokenEmbedding(vocab_size=100, d_model=16)
+        ids = np.array([[1, 2, 3]], dtype=np.int64)
+        emb.forward(ids)
+
+        grad = np.random.randn(1, 3, 16)
+        emb.backward(grad)
+
+        # Tokens 4, 5, 99 were NOT in the input — should have zero gradient
+        assert np.all(emb.grad_weight[4, :] == 0), "Token 4 has non-zero gradient"
+        assert np.all(emb.grad_weight[5, :] == 0), "Token 5 has non-zero gradient"
+        assert np.all(emb.grad_weight[99, :] == 0), "Token 99 has non-zero gradient"
+
+    def test_positional_embedding_receives_gradient(self) -> None:
+        """Learned positional embeddings should receive gradients during backward.
+
+        When the model is trained, the positional embeddings should be
+        updated just like the token embeddings.  This test verifies that
+        the backward pass produces non-zero gradients for the position
+        embeddings.
+        """
+        np.random.seed(42)
+        pe = LearnedPositionalEmbedding(max_len=10, d_model=16)
+        pe.forward(seq_len=5)
+
+        # Simulate gradient flowing back (batch=2 for generality)
+        grad = np.random.randn(2, 5, 16)
+        pe.backward(grad)
+
+        # Positions 0-4 were used — should have non-zero gradient
+        for pos in range(5):
+            assert np.any(pe.grad_weight[pos, :] != 0), f"Position {pos} has zero gradient"
+
+        # Positions 5-9 were NOT used — should have zero gradient
+        for pos in range(5, 10):
+            assert np.all(pe.grad_weight[pos, :] == 0), (
+                f"Position {pos} has non-zero gradient (should be zero)"
+            )

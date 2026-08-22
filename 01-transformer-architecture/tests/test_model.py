@@ -23,6 +23,7 @@ Key properties under test:
 
 import numpy as np
 from model import GPT, Transformer, cross_entropy_loss, softmax
+from tokenizer import BPETokenizer
 
 # ======================================================================
 # Utilities
@@ -344,3 +345,218 @@ class TestTransformer:
         enc_out = model.encode(src, training=False)
         dec_out = model.decode(tgt, enc_out, training=False)
         assert dec_out.shape == (1, 2, 64)
+
+
+# ======================================================================
+# Text learning tests
+# ======================================================================
+
+
+class TestGPTTextLearning:
+    """Tests that the GPT model can learn from text data.
+
+    These tests exercise the full training pipeline:
+        forward → loss → backward → optimizer step
+
+    They verify that:
+        - Loss decreases over training steps
+        - The model can predict the correct next token after training
+        - Generated text contains words from the training corpus
+    """
+
+    @staticmethod
+    def _make_tokenizer() -> BPETokenizer:
+        """Creates a tokenizer trained on a tiny repetitive corpus."""
+        tok = BPETokenizer(vocab_size=300)
+        tok.train(
+            [
+                "the cat sat on the mat",
+                "the dog sat on the log",
+                "the cat sat on the dog",
+            ]
+        )
+        return tok
+
+    @staticmethod
+    def _make_model(vocab_size: int) -> GPT:
+        """Creates a small GPT model for fast tests."""
+        np.random.seed(42)
+        return GPT(
+            vocab_size=vocab_size,
+            d_model=32,
+            num_heads=4,
+            num_layers=2,
+            d_ff=64,
+            max_len=32,
+            dropout_rate=0.0,
+        )
+
+    def test_gpt_loss_decreases(self) -> None:
+        """Training the GPT model should reduce the loss over 50 epochs.
+
+        This is the most fundamental test of the training loop: the loss
+        must go down.  If it doesn't, either the gradients are wrong or
+        the optimizer is broken.
+        """
+        from trainer import Trainer, prepare_text_batch
+
+        tok = self._make_tokenizer()
+        model = self._make_model(len(tok))
+        corpus = ["the cat sat on the mat", "the dog sat on the log"]
+
+        inp, tgt, msk = prepare_text_batch(corpus, tok, seq_len=8)
+        initial_loss = cross_entropy_loss(model.forward(inp, mask=msk, training=False), tgt, msk)
+
+        trainer = Trainer(model, tok, lr=0.1, momentum=0.9)
+        trainer.train(corpus, epochs=50, seq_len=8, verbose=False)
+
+        final_loss = trainer.loss_history[-1]
+        assert final_loss < initial_loss * 0.8, (
+            f"GPT loss did not decrease: {initial_loss:.4f} → {final_loss:.4f}"
+        )
+
+    def test_gpt_predicts_next_token(self) -> None:
+        """After training, GPT should predict 'sat' after 'the cat'.
+
+        This tests that the model has actually learned the patterns in
+        the training data, not just that the loss decreased.  The corpus
+        always has 'the cat sat', so the model should predict 'sat'.
+        """
+        from trainer import Trainer
+
+        tok = self._make_tokenizer()
+        model = self._make_model(len(tok))
+        corpus = [
+            "the cat sat on the mat",
+            "the cat sat on the log",
+            "the cat sat on the dog",
+        ]
+
+        trainer = Trainer(model, tok, lr=0.1, momentum=0.9)
+        trainer.train(corpus, epochs=200, seq_len=8, verbose=False)
+
+        prompt_ids = np.array([tok.encode("the cat")], dtype=np.int64)
+        logits = model.forward(prompt_ids, training=False)
+        predicted_id = int(np.argmax(logits[0, -1]))
+        predicted_token = tok.vocab.get(predicted_id, "?")
+
+        assert predicted_token == "sat", (
+            f"Expected 'sat' but got '{predicted_token}' (id={predicted_id})"
+        )
+
+    def test_gpt_generation_contains_corpus_words(self) -> None:
+        """After training, generated text should contain words from the corpus.
+
+        The model should generate text that resembles the training data,
+        not random gibberish.  We check that at least one corpus word
+        appears in the generated text.
+        """
+        from trainer import Trainer
+
+        tok = self._make_tokenizer()
+        model = self._make_model(len(tok))
+        corpus = [
+            "the cat sat on the mat",
+            "the cat sat on the log",
+            "the cat sat on the dog",
+        ]
+
+        trainer = Trainer(model, tok, lr=0.1, momentum=0.9)
+        trainer.train(corpus, epochs=200, seq_len=8, verbose=False)
+
+        prompt_ids = np.array([tok.encode("the cat")], dtype=np.int64)
+        generated = model.generate(prompt_ids, max_new_tokens=5, temperature=0.0)
+        generated_text = tok.decode(generated)
+
+        corpus_words = set()
+        for text in corpus:
+            corpus_words.update(text.split())
+        generated_words = set(generated_text.split())
+        overlap = generated_words & corpus_words
+
+        assert len(overlap) > 0, (
+            f"Generated '{generated_text}' contains no corpus words. "
+            f"Expected overlap with: {corpus_words}"
+        )
+
+    def test_gpt_backward_produces_gradients(self) -> None:
+        """After forward + backward, all parameters should have gradients.
+
+        This verifies that the backward pass reaches every parameter in
+        the model, not just a subset.  Missing gradients would mean some
+        parts of the model are not learning.
+        """
+        from model import softmax_cross_entropy_backward
+
+        tok = self._make_tokenizer()
+        model = self._make_model(len(tok))
+
+        inp = np.array([tok.encode("the cat sat")], dtype=np.int64)
+        tgt = np.array([tok.encode("cat sat on")], dtype=np.int64)
+        msk = np.array([[1, 1, 1]], dtype=np.float64)
+
+        logits = model.forward(inp, mask=msk, training=True)
+        d_logits = softmax_cross_entropy_backward(logits, tgt, msk)
+        model.backward(d_logits)
+        grads = model.get_grads()
+
+        # Check that all gradients are non-zero
+        for name, grad in grads.items():
+            assert np.any(grad != 0), f"Gradient for {name} is all zeros"
+
+
+class TestModelSerialization:
+    """Tests for save_model / load_model and tokenizer save / load."""
+
+    @staticmethod
+    def _make_tokenizer() -> BPETokenizer:
+        """Creates a small trained tokenizer."""
+        tok = BPETokenizer(vocab_size=300)
+        tok.train(["the cat sat on the mat", "the dog sat on the log"])
+        return tok
+
+    @staticmethod
+    def _make_model(vocab_size: int) -> GPT:
+        """Creates a small GPT model."""
+        np.random.seed(42)
+        return GPT(
+            vocab_size=vocab_size,
+            d_model=32,
+            num_heads=4,
+            num_layers=2,
+            d_ff=64,
+            max_len=32,
+            dropout_rate=0.0,
+        )
+
+    def test_save_load_roundtrip(self, tmp_path) -> None:
+        """A saved model should produce identical outputs after loading."""
+        from model import load_model, save_model
+
+        tok = self._make_tokenizer()
+        model = self._make_model(len(tok))
+
+        prompt = np.array([tok.encode("the cat")], dtype=np.int64)
+        logits_before = model.forward(prompt, training=False)
+        gen_before = model.generate(prompt, max_new_tokens=5, temperature=0.0)
+
+        model_path = tmp_path / "model.npz"
+        tok_path = tmp_path / "tok.json"
+        save_model(model, str(model_path))
+        tok.save(str(tok_path))
+
+        loaded = load_model(str(model_path))
+        loaded_tok = BPETokenizer.load(str(tok_path))
+
+        # Consistency checks between model and tokenizer.
+        assert loaded.vocab_size == len(loaded_tok), (
+            f"Model vocab size ({loaded.vocab_size}) != tokenizer size ({len(loaded_tok)})"
+        )
+
+        logits_after = loaded.forward(prompt, training=False)
+        gen_after = loaded.generate(prompt, max_new_tokens=5, temperature=0.0)
+
+        assert np.allclose(logits_before, logits_after), "Logits differ after save/load roundtrip"
+        assert gen_before == gen_after, (
+            f"Generation differs: before={gen_before}, after={gen_after}"
+        )

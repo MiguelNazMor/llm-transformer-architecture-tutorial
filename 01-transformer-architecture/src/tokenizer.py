@@ -5,6 +5,8 @@ by GPT models.  Includes training (learning merges from a corpus), encoding
 (text → token IDs), and decoding (token IDs → text).
 """
 
+from __future__ import annotations
+
 from collections import Counter
 from typing import Self
 
@@ -207,7 +209,7 @@ class BPETokenizer:
 
     def encode_batch(
         self, texts: list[str], max_len: int | None = None
-    ) -> tuple[list[list[int]], list[int]]:
+    ) -> tuple[list[list[int]], list[list[int]]]:
         """Encodes a batch of texts with padding and attention masks.
 
         Args:
@@ -243,6 +245,52 @@ class BPETokenizer:
             f"trained_tokens={len(self.vocab)}, "
             f"merges={len(self.merges)})"
         )
+
+    def vocab_size_trained(self) -> int:
+        """Returns the actual number of tokens learned (not the target)."""
+        return len(self.vocab)
+
+    # ------------------------------------------------------------------
+    # Serialization
+    # ------------------------------------------------------------------
+
+    def save(self, path: str) -> None:
+        """Saves the tokenizer to a JSON file.
+
+        Args:
+            path: File path (e.g., "tokenizer.json").
+        """
+        import json
+
+        data = {
+            "vocab_size": self.vocab_size,
+            "merges": [(a, b) for a, b in self.merges],
+            "vocab": {str(k): v for k, v in self.vocab.items()},
+        }
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    @classmethod
+    def load(cls, path: str) -> BPETokenizer:
+        """Loads a tokenizer from a JSON file saved by save().
+
+        Args:
+            path: File path to the saved tokenizer.
+
+        Returns:
+            A BPETokenizer with restored vocabulary and merges.
+        """
+        import json
+
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        tok = cls(vocab_size=data["vocab_size"])
+        tok.merges = [(a, b) for a, b in data["merges"]]
+        tok.vocab = {int(k): v for k, v in data["vocab"].items()}
+        tok._next_id = max(tok.vocab.keys()) + 1 if tok.vocab else 4
+        tok._token_to_id = {v: k for k, v in tok.vocab.items()}
+        return tok
 
     # ------------------------------------------------------------------
     # Serialization helpers for demo purposes

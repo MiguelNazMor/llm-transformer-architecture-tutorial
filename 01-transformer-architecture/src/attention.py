@@ -38,8 +38,9 @@ def scaled_dot_product_attention(
     scores = np.matmul(query, key.swapaxes(-2, -1)) / np.sqrt(d_k)
 
     if mask is not None:
-        # Expand mask to (batch, 1, seq_len_k) for broadcasting, then set masked
-        # positions to a large negative value so they become 0 after softmax.
+        # Mask arrives pre-expanded from MultiHeadAttention (includes head dim).
+        # Set masked positions to a large negative value so they become 0
+        # after softmax.
         scores = np.where(mask == 0, -1e9, scores)
 
     # Softmax over the last dimension (the key sequence).
@@ -138,19 +139,151 @@ class MultiHeadAttention:
         v = v.reshape(batch_size, seq_len, self.num_heads, self.d_v).swapaxes(1, 2)
 
         # Expand mask to (batch, 1, 1, seq_len) for broadcasting across heads.
+        expanded_mask = None
         if mask is not None:
-            mask = mask[:, np.newaxis, :, :]
+            expanded_mask = mask[:, np.newaxis, :, :]
 
         # Attention per head.
         attn_out = scaled_dot_product_attention(
-            q, k, v, mask=mask, dropout_rate=self.dropout_rate, training=training
+            q, k, v, mask=expanded_mask, dropout_rate=self.dropout_rate, training=training
         )
 
         # Concatenate heads: (batch, seq_len, d_model).
-        attn_out = attn_out.swapaxes(1, 2).reshape(batch_size, seq_len, self.d_model)
+        attn_concat = attn_out.swapaxes(1, 2).reshape(batch_size, seq_len, self.d_model)
 
         # Output projection.
-        return np.matmul(attn_out, self.W_o) + self.b_o
+        out = np.matmul(attn_concat, self.W_o) + self.b_o
+
+        # Cache for backward (only if training=True to save memory in eval mode).
+        if training:
+            self._cache = {
+                "x": x,
+                "q": q,
+                "k": k,
+                "v": v,
+                "attn_concat": attn_concat,
+                "expanded_mask": expanded_mask,
+            }
+            # Recompute attention weights for backward (needed for softmax gradient).
+            d_k = q.shape[-1]
+            scores = np.matmul(q, k.swapaxes(-2, -1)) / np.sqrt(d_k)
+            if expanded_mask is not None:
+                scores = np.where(expanded_mask == 0, -1e9, scores)
+            scores_max = np.max(scores, axis=-1, keepdims=True)
+            scores_exp = np.exp(scores - scores_max)
+            self._cache["attn_weights"] = scores_exp / np.sum(scores_exp, axis=-1, keepdims=True)
+
+        return out
+
+    def backward(self, grad_output: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Backward pass for self-attention (and cross-attention).
+
+        Supports both self-attention and cross-attention.  When called after
+        cross_attention_forward(), the cache includes "x_enc" and only the Q
+        gradient flows back to the decoder input (K and V gradients go to
+        the encoder output, which is handled separately).
+
+        Args:
+            grad_output: Gradient w.r.t. the output, shape (batch, seq_len, d_model).
+
+        Returns:
+            Gradient w.r.t. the input, shape (batch, seq_len, d_model).
+        """
+        if not hasattr(self, "grad_W_q"):
+            self._init_grads()
+        c = self._cache
+        x = c["x"]
+        batch_size, seq_len, _ = x.shape
+
+        # For cross-attention, K and V come from encoder output, not from x.
+        x_kv = c.get("x_enc", x)  # use encoder output if available (cross-attn)
+
+        # Backprop through output projection: out = attn_concat @ W_o + b_o
+        self.grad_W_o += np.matmul(
+            c["attn_concat"].reshape(-1, self.d_model).T, grad_output.reshape(-1, self.d_model)
+        )
+        self.grad_b_o += grad_output.reshape(-1, self.d_model).sum(axis=0)
+        d_attn_concat = np.matmul(grad_output, self.W_o.T)  # (batch, seq_len, d_model)
+
+        # Reshape back to (batch, num_heads, seq_len, d_k)
+        d_attn_out = d_attn_concat.reshape(batch_size, seq_len, self.num_heads, self.d_k).swapaxes(
+            1, 2
+        )
+
+        # Backprop through attention: attn_out = attn_weights @ v
+        d_attn_weights = np.matmul(
+            d_attn_out, c["v"].swapaxes(-2, -1)
+        )  # (batch, heads, seq_q, seq_k)
+        d_v = np.matmul(
+            c["attn_weights"].swapaxes(-2, -1), d_attn_out
+        )  # (batch, heads, seq_k, d_v)
+
+        # Backprop through softmax
+        # d_softmax: for each row, ds_i = s_i * (ds_i - sum_j(s_j * ds_j))
+        attn_weights = c["attn_weights"]
+        d_scores = attn_weights * (
+            d_attn_weights - np.sum(attn_weights * d_attn_weights, axis=-1, keepdims=True)
+        )
+
+        # Backprop through scaling: scores = QK^T / sqrt(d_k)
+        d_k = c["q"].shape[-1]
+        d_scores /= np.sqrt(d_k)
+
+        # Apply mask gradient: masked positions had scores = -1e9, so their
+        # softmax output was ~0, and their gradient is ~0. No special handling needed.
+
+        # Backprop through QK^T: scores = Q @ K^T
+        d_q = np.matmul(d_scores, c["k"])  # (batch, heads, seq_q, d_k)
+        d_k_mat = np.matmul(d_scores.swapaxes(-2, -1), c["q"])  # (batch, heads, seq_k, d_k)
+
+        # Reshape Q, K, V gradients back to (batch, seq_len, d_model)
+        d_q_flat = d_q.swapaxes(1, 2).reshape(batch_size, seq_len, self.d_model)
+        d_k_flat = d_k_mat.swapaxes(1, 2).reshape(batch_size, -1, self.d_model)
+        d_v_flat = d_v.swapaxes(1, 2).reshape(batch_size, -1, self.d_model)
+
+        # Backprop through linear projections.
+        # Q comes from x (decoder input).  K and V come from x_kv (which is
+        # x for self-attn, or encoder_output for cross-attn).
+        self.grad_W_q += np.matmul(
+            x.reshape(-1, self.d_model).T, d_q_flat.reshape(-1, self.d_model)
+        )
+        self.grad_W_k += np.matmul(
+            x_kv.reshape(-1, self.d_model).T, d_k_flat.reshape(-1, self.d_model)
+        )
+        self.grad_W_v += np.matmul(
+            x_kv.reshape(-1, self.d_model).T, d_v_flat.reshape(-1, self.d_model)
+        )
+        self.grad_b_q += d_q_flat.reshape(-1, self.d_model).sum(axis=0)
+        self.grad_b_k += d_k_flat.reshape(-1, self.d_model).sum(axis=0)
+        self.grad_b_v += d_v_flat.reshape(-1, self.d_model).sum(axis=0)
+
+        # Gradient w.r.t. input.
+        # For self-attention: all three paths (Q, K, V) flow back to x.
+        # For cross-attention: only the Q path flows back to the decoder input.
+        if "x_enc" in c:
+            d_x = np.matmul(d_q_flat, self.W_q.T)  # only Q path for cross-attn
+        else:
+            d_x = (
+                np.matmul(d_q_flat, self.W_q.T)
+                + np.matmul(d_k_flat, self.W_k.T)
+                + np.matmul(d_v_flat, self.W_v.T)
+            )
+        return d_x
+
+    def _init_grads(self) -> None:
+        """Initializes gradient accumulators to zero."""
+        self.grad_W_q = np.zeros_like(self.W_q)
+        self.grad_W_k = np.zeros_like(self.W_k)
+        self.grad_W_v = np.zeros_like(self.W_v)
+        self.grad_W_o = np.zeros_like(self.W_o)
+        self.grad_b_q = np.zeros_like(self.b_q)
+        self.grad_b_k = np.zeros_like(self.b_k)
+        self.grad_b_v = np.zeros_like(self.b_v)
+        self.grad_b_o = np.zeros_like(self.b_o)
+
+    def zero_grad(self) -> None:
+        """Resets all gradient accumulators to zero."""
+        self._init_grads()
 
     def cross_attention_forward(
         self,
@@ -185,15 +318,38 @@ class MultiHeadAttention:
         k = k.reshape(batch_size, seq_len_enc, self.num_heads, self.d_k).swapaxes(1, 2)
         v = v.reshape(batch_size, seq_len_enc, self.num_heads, self.d_v).swapaxes(1, 2)
 
+        expanded_mask = None
         if mask is not None:
-            mask = mask[:, np.newaxis, :, :]
+            expanded_mask = mask[:, np.newaxis, :, :]
 
         attn_out = scaled_dot_product_attention(
-            q, k, v, mask=mask, dropout_rate=self.dropout_rate, training=training
+            q, k, v, mask=expanded_mask, dropout_rate=self.dropout_rate, training=training
         )
 
-        attn_out = attn_out.swapaxes(1, 2).reshape(batch_size, seq_len_dec, self.d_model)
-        return np.matmul(attn_out, self.W_o) + self.b_o
+        attn_concat = attn_out.swapaxes(1, 2).reshape(batch_size, seq_len_dec, self.d_model)
+        out = np.matmul(attn_concat, self.W_o) + self.b_o
+
+        # Cache for backward.  "x_enc" signals to backward() that this was
+        # cross-attention, so K/V gradients use encoder_output instead of x.
+        if training:
+            self._cache = {
+                "x": x,
+                "x_enc": encoder_output,  # K and V source for cross-attention
+                "q": q,
+                "k": k,
+                "v": v,
+                "attn_concat": attn_concat,
+                "expanded_mask": expanded_mask,
+            }
+            d_k = q.shape[-1]
+            scores = np.matmul(q, k.swapaxes(-2, -1)) / np.sqrt(d_k)
+            if expanded_mask is not None:
+                scores = np.where(expanded_mask == 0, -1e9, scores)
+            scores_max = np.max(scores, axis=-1, keepdims=True)
+            scores_exp = np.exp(scores - scores_max)
+            self._cache["attn_weights"] = scores_exp / np.sum(scores_exp, axis=-1, keepdims=True)
+
+        return out
 
 
 def create_causal_mask(seq_len: int) -> NDArray[np.float64]:

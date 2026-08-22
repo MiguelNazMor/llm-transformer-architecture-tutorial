@@ -21,6 +21,26 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
 
+[tool.ruff.lint.per-file-ignores]
+# E402: module level import not at top of file — intentional for sys.path setup
+"01-transformer-architecture/src/train.py" = ["E402"]
+"02-pretraining-finetuning/**/*.py" = ["E402"]
+"03-adapters/**/*.py" = ["E402"]
+"04-lora/**/*.py" = ["E402"]
+"05-qlora/**/*.py" = ["E402"]
+"06-peft-ecosystem/**/*.py" = ["E402"]
+# N806: allow uppercase variable names in test/quantization code
+"05-qlora/tests/*.py" = ["N806"]
+"05-qlora/src/*.py" = ["N806"]
+"04-lora/tests/*.py" = ["N806"]
+# E501: line too long for module docstrings with PYTHONPATH commands
+"06-peft-ecosystem/src/peft_demo.py" = ["E501"]
+"06-peft-ecosystem/src/compare.py" = ["E501"]
+"03-adapters/src/demo.py" = ["E501"]
+"04-lora/src/lora.py" = ["E501", "N803"]
+# E741: ambiguous variable name 'l' in generator expressions
+"05-qlora/src/qlora_gpt.py" = ["E741"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
